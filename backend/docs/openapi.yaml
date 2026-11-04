@@ -1,0 +1,92 @@
+openapi: 3.0.3
+info:
+  title: TaskFlow API
+  version: 1.0.0
+  description: REST API учебного трекера задач
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: {type: string}
+            message: {type: string}
+paths:
+  /health:
+    get:
+      security: []
+      summary: Проверка доступности API
+      responses:
+        '200': {description: API работает}
+  /auth/register:
+    post:
+      security: []
+      summary: Регистрация пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name, password]
+              properties:
+                email: {type: string, format: email}
+                name: {type: string}
+                password: {type: string, minLength: 8}
+      responses:
+        '200': {description: Пользователь создан}
+        '400': {description: Ошибка валидации}
+  /auth/login:
+    post:
+      security: []
+      summary: Вход и получение JWT
+      responses:
+        '200': {description: Токены выданы}
+        '401': {description: Ошибка авторизации}
+  /projects:
+    get:
+      summary: Список доступных проектов
+      responses:
+        '200': {description: Список проектов}
+    post:
+      summary: Создать проект
+      responses:
+        '200': {description: Проект создан}
+  /projects/{id}/tasks:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: {type: integer}
+    get:
+      summary: Задачи проекта с фильтрами и пагинацией
+      parameters:
+        - in: query
+          name: page
+          schema: {type: integer, minimum: 1}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100}
+        - in: query
+          name: status
+          schema: {type: string, enum: [backlog, todo, in_progress, review, done]}
+        - in: query
+          name: search
+          schema: {type: string}
+      responses:
+        '200': {description: Список задач}
+    post:
+      summary: Создать задачу
+      responses:
+        '200': {description: Задача создана}

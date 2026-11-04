@@ -1,0 +1,7 @@
+.env
+node_modules/
+dist/
+coverage/
+backend/uploads/
+*.log
+.DS_Store
