@@ -80,6 +80,12 @@ function App() {
 
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [assigneeFilter, setAssigneeFilter] = useState('');
+  const [sort, setSort] = useState('created_at');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [taskPage, setTaskPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   const [showCreate, setShowCreate] = useState(false);
   const [createKind, setCreateKind] = useState<'project' | 'task'>('task');
@@ -97,9 +103,18 @@ function App() {
     useState<'help' | 'settings' | null>(null);
 
   const [profileOpen, setProfileOpen] = useState(false);
+  const [profileName, setProfileName] = useState(user?.name ?? '');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [profileError, setProfileError] = useState('');
+  const [profileSuccess, setProfileSuccess] = useState('');
 
   const qc = useQueryClient();
   const nav = useNavigate();
+
+  useEffect(() => {
+    if (user) setProfileName(user.name);
+  }, [user?.name]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -139,24 +154,31 @@ function App() {
     }
   }, [currentProject, projectID]);
 
+  const membersQuery = useQuery({
+    queryKey: ['project-members', currentProject?.id],
+    queryFn: async () => (await api.get(`/projects/${currentProject!.id}/members`)).data.data as { id: number; name: string; email: string }[],
+    enabled: !!user && !!currentProject,
+  });
+
   const tasksQuery = useQuery({
-    queryKey: ['tasks', currentProject?.id, search, filter],
+    queryKey: ['tasks', currentProject?.id, search, filter, statusFilter, assigneeFilter, sort, sortOrder, taskPage, pageSize],
     queryFn: async () => {
       const params = new URLSearchParams({
-        page: '1',
-        limit: '100',
+        page: String(taskPage),
+        limit: String(pageSize),
         search,
+        sort,
+        order: sortOrder,
       });
+      if (filter) params.set('priority', filter);
+      if (statusFilter) params.set('status', statusFilter);
+      if (assigneeFilter) params.set('assignee_id', assigneeFilter);
 
-      if (filter) {
-        params.set('priority', filter);
-      }
-
-      const result = await api.get(
-        `/projects/${currentProject!.id}/tasks?${params}`
-      );
-
-      return result.data.data.items as Task[];
+      const result = await api.get(`/projects/${currentProject!.id}/tasks?${params}`);
+      return result.data.data as {
+        items: Task[];
+        pagination: { page: number; limit: number; total: number; pages: number };
+      };
     },
     enabled: !!user && !!currentProject,
   });
@@ -172,8 +194,43 @@ function App() {
     enabled: !!user && !!currentProject,
   });
 
-  const tasks = tasksQuery.data ?? [];
+  const tasks = tasksQuery.data?.items ?? [];
+  const pagination = tasksQuery.data?.pagination;
+  const totalPages = Math.max(1, pagination?.pages ?? 1);
   const dashboard = dashboardQuery.data;
+
+  useEffect(() => {
+    if (pagination && taskPage > totalPages) setTaskPage(totalPages);
+  }, [pagination, taskPage, totalPages]);
+
+  async function saveProfile(e: FormEvent) {
+    e.preventDefault();
+    if (!profileName.trim()) { setProfileError('Имя не может быть пустым.'); return; }
+    setProfileError('');
+    setProfileSuccess('');
+    try {
+      const response = await api.patch('/users/me', { name: profileName.trim() });
+      setUser(response.data.data as UserType);
+      setProfileSuccess('Имя успешно обновлено.');
+    } catch (error: any) {
+      setProfileError(error?.response?.data?.error?.message ?? 'Не удалось обновить профиль.');
+    }
+  }
+
+  async function changeOwnPassword(e: FormEvent) {
+    e.preventDefault();
+    setProfileError('');
+    setProfileSuccess('');
+    if (newPassword.length < 8) { setProfileError('Новый пароль должен содержать минимум 8 символов.'); return; }
+    try {
+      await api.post('/users/me/password', { current_password: currentPassword, new_password: newPassword });
+      setCurrentPassword('');
+      setNewPassword('');
+      setProfileSuccess('Пароль успешно изменён.');
+    } catch (error: any) {
+      setProfileError(error?.response?.data?.error?.message ?? 'Не удалось изменить пароль. Проверьте текущий пароль.');
+    }
+  }
 
   async function login(e: FormEvent) {
     e.preventDefault();
@@ -763,33 +820,36 @@ function App() {
                 />
               </div>
 
-              <div className="toolbar">
+              <div className="toolbar task-toolbar">
                 <div className="search-box">
                   <Search size={17} />
-
-                  <input
-                    placeholder="Поиск задач..."
-                    value={search}
-                    onChange={e => setSearch(e.target.value)}
-                  />
+                  <input placeholder="Поиск задач..." value={search} onChange={e => { setSearch(e.target.value); setTaskPage(1); }} />
                 </div>
-
-                <select
-                  value={filter}
-                  onChange={e => setFilter(e.target.value)}
-                  aria-label="Фильтр по приоритету"
-                >
+                <select value={filter} onChange={e => { setFilter(e.target.value); setTaskPage(1); }} aria-label="Фильтр по приоритету">
                   <option value="">Все приоритеты</option>
-                  {priorities.map(p => (
-                    <option key={p.key} value={p.key}>
-                      {p.label}
-                    </option>
-                  ))}
+                  {priorities.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
                 </select>
-
-                <span className="task-count">
-                  {tasks.length} задач
-                </span>
+                <select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setTaskPage(1); }} aria-label="Фильтр по статусу">
+                  <option value="">Все статусы</option>
+                  {statuses.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                </select>
+                <select value={assigneeFilter} onChange={e => { setAssigneeFilter(e.target.value); setTaskPage(1); }} aria-label="Фильтр по исполнителю">
+                  <option value="">Все исполнители</option>
+                  <option value="unassigned">Без исполнителя</option>
+                  {(membersQuery.data ?? []).map(member => <option key={member.id} value={member.id}>{member.name || member.email}</option>)}
+                </select>
+                <select value={sort} onChange={e => { setSort(e.target.value); setTaskPage(1); }} aria-label="Сортировка задач">
+                  <option value="created_at">По дате создания</option>
+                  <option value="updated_at">По обновлению</option>
+                  <option value="due_date">По сроку</option>
+                  <option value="priority">По приоритету</option>
+                  <option value="title">По названию</option>
+                </select>
+                <select value={sortOrder} onChange={e => { setSortOrder(e.target.value as 'asc' | 'desc'); setTaskPage(1); }} aria-label="Направление сортировки">
+                  <option value="desc">По убыванию</option>
+                  <option value="asc">По возрастанию</option>
+                </select>
+                <span className="task-count">{pagination?.total ?? tasks.length} задач</span>
               </div>
 
               {!currentProject ? (
@@ -834,6 +894,20 @@ function App() {
                     ))}
                   </div>
                 </DndContext>
+              )}
+              {currentProject && !tasksQuery.isLoading && !tasksQuery.isError && (
+                <div className="pagination-bar">
+                  <label>На странице
+                    <select value={pageSize} onChange={e => { setPageSize(Number(e.target.value)); setTaskPage(1); }} aria-label="Количество задач на странице">
+                      <option value={10}>10</option><option value={20}>20</option><option value={50}>50</option><option value={100}>100</option>
+                    </select>
+                  </label>
+                  <span>Страница {pagination?.page ?? taskPage} из {totalPages}</span>
+                  <div className="pagination-actions">
+                    <button type="button" className="secondary" disabled={taskPage <= 1} onClick={() => setTaskPage(p => Math.max(1, p - 1))}>Назад</button>
+                    <button type="button" className="secondary" disabled={taskPage >= totalPages} onClick={() => setTaskPage(p => Math.min(totalPages, p + 1))}>Далее</button>
+                  </div>
+                </div>
               )}
             </>
           )}
@@ -1024,21 +1098,28 @@ function App() {
                 <h2>Настройки</h2>
 
                 <div className="form-stack">
-                  <div>
+                  <form className="form-stack profile-form" onSubmit={saveProfile}>
                     <strong>Профиль</strong>
+                    <label>Имя
+                      <input value={profileName} onChange={e => setProfileName(e.target.value)} maxLength={120} required />
+                    </label>
+                    <p className="muted">Email: {user.email}</p>
+                    <p className="muted">Роль: {user.role}</p>
+                    <button className="primary" type="submit">Сохранить имя</button>
+                  </form>
 
-                    <p className="muted">
-                      {user.name}
-                    </p>
-
-                    <p className="muted">
-                      {user.email}
-                    </p>
-
-                    <p className="muted">
-                      Роль: {user.role}
-                    </p>
-                  </div>
+                  <form className="form-stack profile-form" onSubmit={changeOwnPassword}>
+                    <strong>Изменение пароля</strong>
+                    <label>Текущий пароль
+                      <input type="password" autoComplete="current-password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} required />
+                    </label>
+                    <label>Новый пароль
+                      <input type="password" autoComplete="new-password" minLength={8} value={newPassword} onChange={e => setNewPassword(e.target.value)} required />
+                    </label>
+                    <button className="secondary" type="submit">Изменить пароль</button>
+                  </form>
+                  {profileError && <div className="error-box">{profileError}</div>}
+                  {profileSuccess && <div className="success-box">{profileSuccess}</div>}
 
                   <div>
                     <strong>Внешний вид</strong>
@@ -1487,64 +1568,42 @@ function AdminUsers() {
   );
 }
 
-function ActivityPage({
-  project,
-}: {
-  project: Project | undefined;
-}) {
+function ActivityPage({ project }: { project: Project | undefined }) {
+  type HistoryItem = {
+    id: number; task_id: number; task_title: string; actor_id: number;
+    actor_name: string; field: string; old_value: string; new_value: string; created_at: string;
+  };
   const q = useQuery({
     queryKey: ['activity', project?.id],
-
-    queryFn: async () => {
-      const r = await api.get(
-        `/projects/${project!.id}/tasks?limit=100`
-      );
-
-      return r.data.data.items as Task[];
-    },
-
+    queryFn: async () => (await api.get(`/projects/${project!.id}/history`)).data.data as HistoryItem[],
     enabled: !!project,
   });
-
+  const fieldLabels: Record<string, string> = {
+    created: 'создал задачу', status: 'изменил статус', title: 'изменил название',
+    description: 'изменил описание', priority: 'изменил приоритет',
+    assignee_id: 'изменил исполнителя', due_date: 'изменил срок',
+  };
+  const valueLabel = (field: string, value: string) => {
+    if (field === 'status') return statuses.find(item => item.key === value)?.label ?? value;
+    if (field === 'priority') return priorities.find(item => item.key === value)?.label ?? value;
+    return value || '—';
+  };
   return (
     <section className="panel">
       <div className="panel-heading">
-        <div>
-          <h2>Последние задачи</h2>
-          <p className="muted">
-            Обзор текущей работы проекта
-          </p>
-        </div>
-
+        <div><h2>История изменений</h2><p className="muted">Последние действия участников в проекте</p></div>
         <Activity />
       </div>
-
-      {q.isLoading ? (
-        <p className="muted">Загрузка…</p>
-      ) : q.isError ? (
-        <p className="muted">
-          Не удалось загрузить задачи.
-        </p>
-      ) : (
-        q.data?.map(t => (
-          <div className="activity-row" key={t.id}>
-            <span className={`status-dot ${t.status}`} />
-
-            <div>
-              <strong>{t.title}</strong>
-
-              <p className="muted">
-                TF-{t.id} ·{' '}
-                {statuses.find(s => s.key === t.status)?.label}
-              </p>
-            </div>
-
-            <span className={`priority ${t.priority}`}>
-              {priorityLabel(t.priority)}
-            </span>
+      {!project ? <p className="muted">Сначала выберите проект.</p> : q.isLoading ? <p className="muted">Загрузка истории…</p> : q.isError ? <div className="error-box">Не удалось загрузить историю проекта.</div> : q.data?.length ? q.data.map(item => (
+        <div className="activity-row" key={item.id}>
+          <span className="status-dot in_progress" />
+          <div>
+            <strong>{item.actor_name} {fieldLabels[item.field] ?? 'изменил задачу'} «{item.task_title}»</strong>
+            <p className="muted">TF-{item.task_id} · {new Date(item.created_at).toLocaleString()}</p>
+            {item.old_value !== item.new_value && <p className="muted">{valueLabel(item.field, item.old_value)} → {valueLabel(item.field, item.new_value)}</p>}
           </div>
-        ))
-      )}
+        </div>
+      )) : <p className="muted">История пока пуста. Изменения задач будут отображаться здесь.</p>}
     </section>
   );
 }

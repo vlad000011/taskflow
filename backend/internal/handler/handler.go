@@ -242,6 +242,28 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	q.Order("projects.created_at DESC").Find(&ps)
 	httpx.OK(c, ps)
 }
+func (h *Handler) ProjectMembers(c *gin.Context) {
+	projectID := c.Param("id")
+	if !h.canAccessProject(c, projectID) {
+		return
+	}
+	var members []struct {
+		ID    uint   `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+	err := h.DB.Table("users").
+		Select("users.id, users.name, users.email").
+		Joins("JOIN project_members pm ON pm.user_id = users.id").
+		Where("pm.project_id = ?", projectID).
+		Order("users.name ASC").Scan(&members).Error
+	if err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось получить участников проекта")
+		return
+	}
+	httpx.OK(c, members)
+}
+
 func (h *Handler) Project(c *gin.Context) {
 	id := c.Param("id")
 	if !h.canAccessProject(c, id) {
@@ -367,7 +389,11 @@ func (h *Handler) ListTasks(c *gin.Context) {
 		q = q.Where("priority = ?", v)
 	}
 	if v := c.Query("assignee_id"); v != "" {
-		q = q.Where("assignee_id = ?", v)
+		if v == "unassigned" {
+			q = q.Where("assignee_id IS NULL")
+		} else {
+			q = q.Where("assignee_id = ?", v)
+		}
 	}
 	if v := c.Query("search"); v != "" {
 		q = q.Where("(title ILIKE ? OR description ILIKE ?)", "%"+v+"%", "%"+v+"%")
@@ -465,25 +491,32 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 		return
 	}
 	updates := map[string]any{}
+	history := make([]model.TaskHistory, 0, 6)
+	addHistory := func(field, oldValue, newValue string) {
+		if oldValue != newValue {
+			history = append(history, model.TaskHistory{TaskID: t.ID, ActorID: uid(c), Field: field, OldValue: oldValue, NewValue: newValue})
+		}
+	}
 	if in.Title != nil {
-		if strings.TrimSpace(*in.Title) == "" {
+		value := strings.TrimSpace(*in.Title)
+		if value == "" {
 			fail(c, "VALIDATION_ERROR", "Название обязательно")
 			return
 		}
-		updates["title"] = strings.TrimSpace(*in.Title)
+		updates["title"] = value
+		addHistory("title", t.Title, value)
 	}
 	if in.Description != nil {
 		updates["description"] = *in.Description
+		addHistory("description", t.Description, *in.Description)
 	}
 	if in.Status != nil {
 		if !service.ValidTaskStatus(*in.Status) {
 			fail(c, "VALIDATION_ERROR", "Недопустимый статус")
 			return
 		}
-		if t.Status != *in.Status {
-			updates["status"] = *in.Status
-			h.DB.Create(&model.TaskHistory{TaskID: t.ID, ActorID: uid(c), Field: "status", OldValue: t.Status, NewValue: *in.Status})
-		}
+		updates["status"] = *in.Status
+		addHistory("status", t.Status, *in.Status)
 	}
 	if in.Priority != nil {
 		if !service.ValidPriority(*in.Priority) {
@@ -491,17 +524,71 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 			return
 		}
 		updates["priority"] = *in.Priority
+		addHistory("priority", t.Priority, *in.Priority)
 	}
 	if in.AssigneeID != nil {
 		updates["assignee_id"] = *in.AssigneeID
+		oldValue, newValue := "", strconv.FormatUint(uint64(*in.AssigneeID), 10)
+		if t.AssigneeID != nil {
+			oldValue = strconv.FormatUint(uint64(*t.AssigneeID), 10)
+		}
+		addHistory("assignee_id", oldValue, newValue)
 	}
 	if in.DueDate != nil {
 		updates["due_date"] = *in.DueDate
+		oldValue := ""
+		if t.DueDate != nil {
+			oldValue = t.DueDate.Format(time.RFC3339)
+		}
+		addHistory("due_date", oldValue, in.DueDate.Format(time.RFC3339))
 	}
 	if len(updates) > 0 {
-		h.DB.Model(&t).Updates(updates)
+		err := h.DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&t).Updates(updates).Error; err != nil {
+				return err
+			}
+			if len(history) > 0 {
+				return tx.Create(&history).Error
+			}
+			return nil
+		})
+		if err != nil {
+			httpx.Error(c, 500, "UPDATE_FAILED", "Не удалось обновить задачу")
+			return
+		}
 	}
 	h.Task(c)
+}
+
+// ProjectHistory returns an access-controlled activity feed for a project.
+func (h *Handler) ProjectHistory(c *gin.Context) {
+	projectID := c.Param("id")
+	if !h.canAccessProject(c, projectID) {
+		return
+	}
+	type historyRow struct {
+		ID        uint      `json:"id"`
+		TaskID    uint      `json:"task_id"`
+		TaskTitle string    `json:"task_title"`
+		ActorID   uint      `json:"actor_id"`
+		ActorName string    `json:"actor_name"`
+		Field     string    `json:"field"`
+		OldValue  string    `json:"old_value"`
+		NewValue  string    `json:"new_value"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	var rows []historyRow
+	err := h.DB.Table("task_history").
+		Select("task_history.id, task_history.task_id, tasks.title AS task_title, task_history.actor_id, users.name AS actor_name, task_history.field, task_history.old_value, task_history.new_value, task_history.created_at").
+		Joins("JOIN tasks ON tasks.id = task_history.task_id").
+		Joins("JOIN users ON users.id = task_history.actor_id").
+		Where("tasks.project_id = ?", projectID).
+		Order("task_history.created_at DESC").Limit(200).Scan(&rows).Error
+	if err != nil {
+		httpx.Error(c, 500, "HISTORY_ERROR", "Не удалось загрузить историю проекта")
+		return
+	}
+	httpx.OK(c, rows)
 }
 func (h *Handler) DeleteTask(c *gin.Context) {
 	var t model.Task
