@@ -27,6 +27,8 @@ import {
   Sun,
   Users,
   User,
+  Upload as UploadIcon,
+  Download,
   X,
 } from 'lucide-react';
 
@@ -96,6 +98,7 @@ function App() {
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [editError, setEditError] = useState('');
+  const [uploadingTaskIds, setUploadingTaskIds] = useState<number[]>([]);
 
   const [activePage, setActivePage] = useState('board');
 
@@ -362,6 +365,47 @@ function App() {
     } catch (error: any) {
       const message = error?.response?.data?.message ?? error?.response?.data?.error?.message ?? error?.message;
       window.alert(`Не удалось удалить задачу${message ? `: ${message}` : '. Проверьте права доступа.'}`);
+    }
+  }
+
+  async function uploadTaskFile(task: Task, file?: File) {
+    if (!file) return;
+    const allowed = /\.(png|jpe?g|pdf|txt|docx)$/i.test(file.name);
+    if (!allowed) {
+      window.alert('Разрешены файлы PNG, JPG, PDF, TXT и DOCX.');
+      return;
+    }
+    setUploadingTaskIds(ids => [...ids, task.id]);
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      await api.post(`/tasks/${task.id}/attachment`, form);
+      await qc.invalidateQueries({ queryKey: ['tasks'] });
+      window.alert('Файл прикреплён к задаче.');
+    } catch (error: any) {
+      const message = error?.response?.data?.message ?? error?.response?.data?.error?.message;
+      window.alert(message ?? 'Не удалось прикрепить файл. Проверьте права доступа и размер файла.');
+    } finally {
+      setUploadingTaskIds(ids => ids.filter(id => id !== task.id));
+    }
+  }
+
+  async function downloadTaskFile(task: Task) {
+    try {
+      const response = await api.get(`/tasks/${task.id}/attachment`, { responseType: 'blob' });
+      const disposition = response.headers['content-disposition'] as string | undefined;
+      const match = disposition?.match(/filename="?([^";]+)"?/i);
+      const filename = match?.[1] ?? `task-${task.id}-attachment`;
+      const url = URL.createObjectURL(response.data);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      window.alert('Не удалось скачать вложение. Возможно, у вас нет доступа к проекту.');
     }
   }
 
@@ -890,6 +934,9 @@ function App() {
                         onPriorityChange={changePriority}
                         onEdit={task => { setEditError(''); setEditingTask(task); }}
                         onDelete={deleteTask}
+                        onUpload={uploadTaskFile}
+                        onDownload={downloadTaskFile}
+                        uploadingTaskIds={uploadingTaskIds}
                       />
                     ))}
                   </div>
@@ -1191,6 +1238,9 @@ function KanbanColumn({
   onPriorityChange,
   onEdit,
   onDelete,
+  onUpload,
+  onDownload,
+  uploadingTaskIds,
 }: {
   status: TaskStatus;
   label: string;
@@ -1199,6 +1249,9 @@ function KanbanColumn({
   onPriorityChange: (task: Task, priority: Task['priority']) => void;
   onEdit: (task: Task) => void;
   onDelete: (task: Task) => void;
+  onUpload: (task: Task, file?: File) => void;
+  onDownload: (task: Task) => void;
+  uploadingTaskIds: number[];
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: status,
@@ -1228,6 +1281,9 @@ function KanbanColumn({
             onPriorityChange={onPriorityChange}
             onEdit={onEdit}
             onDelete={onDelete}
+            onUpload={onUpload}
+            onDownload={onDownload}
+            isUploading={uploadingTaskIds.includes(task.id)}
           />
         ))}
       </div>
@@ -1241,12 +1297,18 @@ function TaskCard({
   onPriorityChange,
   onEdit,
   onDelete,
+  onUpload,
+  onDownload,
+  isUploading,
 }: {
   task: Task;
   onMove: (task: Task, status: TaskStatus) => void;
   onPriorityChange: (task: Task, priority: Task['priority']) => void;
   onEdit: (task: Task) => void;
   onDelete: (task: Task) => void;
+  onUpload: (task: Task, file?: File) => void;
+  onDownload: (task: Task) => void;
+  isUploading: boolean;
 }) {
   const {
     attributes,
@@ -1289,6 +1351,27 @@ function TaskCard({
       {task.description && (
         <p>{task.description}</p>
       )}
+
+      <div className="task-attachments" onPointerDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}>
+        {task.attachment_path && (
+          <button type="button" className="attachment-download" onClick={() => onDownload(task)}>
+            <Download size={12} /> Скачать вложение
+          </button>
+        )}
+        <label className="attachment-upload">
+          <UploadIcon size={12} /> {isUploading ? 'Загрузка…' : task.attachment_path ? 'Заменить файл' : 'Прикрепить файл'}
+          <input
+            type="file"
+            accept=".png,.jpg,.jpeg,.pdf,.txt,.docx"
+            disabled={isUploading}
+            onChange={e => {
+              const file = e.currentTarget.files?.[0];
+              if (file) onUpload(task, file);
+              e.currentTarget.value = '';
+            }}
+          />
+        </label>
+      </div>
 
       <div className="task-card-bottom">
         <span className="task-date">

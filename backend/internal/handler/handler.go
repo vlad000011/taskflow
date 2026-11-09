@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -16,6 +18,7 @@ import (
 	"taskflow/backend/internal/model"
 	"taskflow/backend/internal/service"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -754,38 +757,141 @@ func (h *Handler) Upload(c *gin.Context) {
 		httpx.Error(c, 403, "FORBIDDEN", "Нет права прикреплять файл к этой задаче")
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(h.Cfg.MaxUploadMB)*1024*1024)
+
+	maxBytes := int64(h.Cfg.MaxUploadMB) * 1024 * 1024
+	if maxBytes <= 0 {
+		maxBytes = 5 * 1024 * 1024
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		httpx.Error(c, 400, "UPLOAD_ERROR", "Файл не передан или превышен лимит размера")
 		return
 	}
 	defer file.Close()
+
 	ext := strings.ToLower(filepath.Ext(header.Filename))
-	allowed := map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".pdf": true, ".txt": true, ".docx": true}
-	if !allowed[ext] {
+	if !allowedUploadExtension(ext) {
 		httpx.Error(c, 400, "INVALID_FILE_TYPE", "Разрешены PNG, JPG, PDF, TXT и DOCX")
 		return
 	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil || int64(len(data)) > maxBytes {
+		httpx.Error(c, 400, "UPLOAD_ERROR", "Файл превышает допустимый размер")
+		return
+	}
+	if !validUploadContent(ext, data) {
+		httpx.Error(c, 400, "INVALID_FILE_CONTENT", "Содержимое файла не соответствует его расширению")
+		return
+	}
+
 	if err = os.MkdirAll(h.Cfg.UploadDir, 0750); err != nil {
 		httpx.Error(c, 500, "UPLOAD_ERROR", "Не удалось сохранить файл")
 		return
 	}
 	name := fmt.Sprintf("task-%d-%d%s", t.ID, time.Now().UnixNano(), ext)
-	out, err := os.OpenFile(filepath.Join(h.Cfg.UploadDir, name), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0640)
-	if err != nil {
+	diskPath := filepath.Join(h.Cfg.UploadDir, name)
+	if err = os.WriteFile(diskPath, data, 0640); err != nil {
 		httpx.Error(c, 500, "UPLOAD_ERROR", "Не удалось сохранить файл")
 		return
 	}
-	_, copyErr := io.Copy(out, file)
-	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
-		httpx.Error(c, 500, "UPLOAD_ERROR", "Ошибка записи файла")
+	if err = h.DB.Model(&t).Update("attachment_path", "/uploads/"+name).Error; err != nil {
+		_ = os.Remove(diskPath)
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось сохранить сведения о вложении")
 		return
 	}
-	h.DB.Model(&t).Update("attachment_path", "/uploads/"+name)
-	httpx.OK(c, gin.H{"path": "/uploads/" + name, "filename": header.Filename})
+	httpx.OK(c, gin.H{
+		"path":     fmt.Sprintf("/api/v1/tasks/%d/attachment", t.ID),
+		"filename": filepath.Base(header.Filename),
+	})
 }
+
+// DownloadAttachment serves task files only after checking membership in the
+// task's project. The upload directory is deliberately not exposed as a
+// public static directory.
+func (h *Handler) DownloadAttachment(c *gin.Context) {
+	var t model.Task
+	if h.DB.First(&t, c.Param("id")).Error != nil {
+		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
+		return
+	}
+	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
+		return
+	}
+	if strings.TrimSpace(t.AttachmentPath) == "" {
+		httpx.Error(c, 404, "NOT_FOUND", "У задачи нет вложения")
+		return
+	}
+
+	// Backward-compatible with existing rows containing "/uploads/<name>".
+	name := filepath.Base(filepath.Clean(t.AttachmentPath))
+	if name == "." || name == string(filepath.Separator) || !strings.HasPrefix(name, fmt.Sprintf("task-%d-", t.ID)) {
+		httpx.Error(c, 404, "NOT_FOUND", "Вложение не найдено")
+		return
+	}
+	diskPath := filepath.Join(h.Cfg.UploadDir, name)
+	info, err := os.Stat(diskPath)
+	if err != nil || !info.Mode().IsRegular() {
+		httpx.Error(c, 404, "NOT_FOUND", "Вложение не найдено")
+		return
+	}
+	contentTypes := map[string]string{
+		".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+		".pdf": "application/pdf", ".txt": "text/plain; charset=utf-8",
+		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	contentType, ok := contentTypes[ext]
+	if !ok {
+		httpx.Error(c, 404, "NOT_FOUND", "Вложение не найдено")
+		return
+	}
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Type", contentType)
+	c.FileAttachment(diskPath, name)
+}
+
+func allowedUploadExtension(ext string) bool {
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".pdf", ".txt", ".docx":
+		return true
+	default:
+		return false
+	}
+}
+
+// validUploadContent checks file signatures rather than trusting the supplied
+// filename. DOCX is a ZIP container and must contain the required Word entries.
+func validUploadContent(ext string, data []byte) bool {
+	switch ext {
+	case ".png":
+		return len(data) >= 8 && bytes.Equal(data[:8], []byte{137, 80, 78, 71, 13, 10, 26, 10})
+	case ".jpg", ".jpeg":
+		return len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff
+	case ".pdf":
+		return bytes.HasPrefix(data, []byte("%PDF-"))
+	case ".txt":
+		return utf8.Valid(data) && !bytes.Contains(data, []byte{0})
+	case ".docx":
+		reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return false
+		}
+		hasContentTypes, hasDocument := false, false
+		for _, f := range reader.File {
+			switch f.Name {
+			case "[Content_Types].xml":
+				hasContentTypes = true
+			case "word/document.xml":
+				hasDocument = true
+			}
+		}
+		return hasContentTypes && hasDocument
+	default:
+		return false
+	}
+}
+
 func (h *Handler) History(c *gin.Context) {
 	var t model.Task
 	if h.DB.First(&t, c.Param("id")).Error != nil {

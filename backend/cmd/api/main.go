@@ -70,12 +70,12 @@ func main() {
 	auth.GET("/tasks/:id/comments", h.ListComments)
 	auth.GET("/tasks/:id/history", h.History)
 	auth.POST("/tasks/:id/attachment", h.Upload)
+	auth.GET("/tasks/:id/attachment", h.DownloadAttachment)
 	admin := auth.Group("/admin")
 	admin.Use(middleware.Roles("admin"))
 	admin.GET("/users", h.AdminUsers)
 	admin.PATCH("/users/:id/role", h.AdminRole)
 	admin.PATCH("/users/:id/status", h.AdminBlock)
-	r.Static("/uploads", cfg.UploadDir)
 	r.GET("/swagger/index.html", func(c *gin.Context) {
 		c.Data(200, "text/html; charset=utf-8", []byte(`<!doctype html><html><head><title>TaskFlow Swagger UI</title><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"></head><body><div id="swagger-ui"></div><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>SwaggerUIBundle({url:"/swagger/openapi.yaml",dom_id:"#swagger-ui"})</script></body></html>`))
 	})

@@ -23,3 +23,9 @@
 /* Profile forms and success feedback */
 .profile-form{padding-bottom:16px;border-bottom:1px solid var(--border)}
 .success-box{padding:10px;border-radius:8px;background:#10b9811a;border:1px solid #10b98144;color:#34d399;font-size:11px}
+
+/* Task attachments */
+.task-attachments{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:8px;border-top:1px solid var(--border)}
+.attachment-upload,.attachment-download{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);border-radius:7px;background:var(--surface2);color:var(--muted);padding:6px 8px;font-size:10px;cursor:pointer;text-decoration:none}
+.attachment-upload:hover,.attachment-download:hover{color:var(--text);border-color:#8b5cf6}
+.attachment-upload input{display:none}
