@@ -210,7 +210,7 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	c.JSON(200, gin.H{"data": gin.H{"changed": true}})
 }
 func (h *Handler) CreateProject(c *gin.Context) {
-	if role(c) != "lead" && !isAdmin(c) {
+	if !service.CanCreateProject(role(c)) {
 		httpx.Error(c, 403, "FORBIDDEN", "Создавать проекты может руководитель или администратор")
 		return
 	}
@@ -295,7 +295,7 @@ func (h *Handler) DeleteProject(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Проект не найден")
 		return
 	}
-	if !isAdmin(c) && p.OwnerID != uid(c) {
+	if !service.CanDeleteProject(role(c), p.OwnerID, uid(c)) {
 		httpx.Error(c, 403, "FORBIDDEN", "Удалить проект может только владелец")
 		return
 	}
@@ -457,18 +457,9 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 		fail(c, "VALIDATION_ERROR", "Некорректные данные")
 		return
 	}
-	if pr == "teacher" {
-		httpx.Error(c, 403, "FORBIDDEN", "Преподаватель имеет доступ только для чтения")
-		return
-	}
-	if pr == "participant" {
-		if t.AssigneeID == nil || *t.AssigneeID != uid(c) || in.Status == nil || in.Title != nil || in.Description != nil || in.Priority != nil || in.AssigneeID != nil || in.DueDate != nil {
-			httpx.Error(c, 403, "FORBIDDEN", "Участник может менять только статус назначенной ему задачи")
-			return
-		}
-	}
-	if pr != "participant" && pr != "lead" && pr != "admin" {
-		httpx.Error(c, 403, "FORBIDDEN", "Недостаточно прав")
+	statusOnly := in.Status != nil && in.Title == nil && in.Description == nil && in.Priority == nil && in.AssigneeID == nil && in.DueDate == nil
+	if !service.CanUpdateTask(role(c), pr, t.AssigneeID, uid(c), statusOnly) {
+		httpx.Error(c, 403, "FORBIDDEN", "Недостаточно прав для изменения этой задачи")
 		return
 	}
 	updates := map[string]any{}
@@ -541,8 +532,8 @@ func (h *Handler) AddComment(c *gin.Context) {
 	if !h.canAccessProject(c, pid) {
 		return
 	}
-	if h.projectRole(c, pid) == "teacher" {
-		httpx.Error(c, 403, "FORBIDDEN", "Преподаватель имеет доступ только для чтения")
+	if !service.CanComment(role(c), h.projectRole(c, pid)) {
+		httpx.Error(c, 403, "FORBIDDEN", "Недостаточно прав для комментария")
 		return
 	}
 	var in struct {
@@ -660,7 +651,7 @@ func (h *Handler) Upload(c *gin.Context) {
 		return
 	}
 	pr := h.projectRole(c, pid)
-	if pr == "teacher" || (pr == "participant" && (t.AssigneeID == nil || *t.AssigneeID != uid(c))) {
+	if !service.CanUpload(role(c), pr, t.AssigneeID, uid(c)) {
 		httpx.Error(c, 403, "FORBIDDEN", "Нет права прикреплять файл к этой задаче")
 		return
 	}
