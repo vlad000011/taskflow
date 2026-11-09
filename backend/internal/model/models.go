@@ -72,6 +72,12 @@ type TaskHistory struct {
 	NewValue  string    `gorm:"type:text" json:"new_value"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// TableName maps TaskHistory to the singular table created by the SQL migration.
+func (TaskHistory) TableName() string {
+	return "task_history"
+}
+
 type RefreshToken struct {
 	ID        uint       `gorm:"primaryKey" json:"id"`
 	UserID    uint       `gorm:"not null;index" json:"user_id"`

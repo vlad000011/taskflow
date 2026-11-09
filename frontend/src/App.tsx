@@ -19,6 +19,8 @@ import {
   LogOut,
   Moon,
   Plus,
+  Pencil,
+  Trash2,
   Search,
   Settings,
   ShieldCheck,
@@ -80,9 +82,14 @@ function App() {
   const [filter, setFilter] = useState('');
 
   const [showCreate, setShowCreate] = useState(false);
+  const [createKind, setCreateKind] = useState<'project' | 'task'>('task');
+  const [createError, setCreateError] = useState('');
   const [newTask, setNewTask] = useState('');
   const [newPriority, setNewPriority] =
     useState<Task['priority']>('medium');
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [editError, setEditError] = useState('');
 
   const [activePage, setActivePage] = useState('board');
 
@@ -197,47 +204,108 @@ function App() {
 
   async function createProject(e: FormEvent) {
     e.preventDefault();
-
     if (!newProject.trim()) return;
-
-    await api.post('/projects', {
-      name: newProject,
-      description: 'Учебный проект',
-    });
-
-    setNewProject('');
-    setShowCreate(false);
-
-    await qc.invalidateQueries({
-      queryKey: ['projects'],
-    });
+    setCreateError('');
+    try {
+      const response = await api.post('/projects', {
+        name: newProject.trim(),
+        description: 'Учебный проект',
+      });
+      const created = response.data.data as Project;
+      setNewProject('');
+      setShowCreate(false);
+      await qc.invalidateQueries({ queryKey: ['projects'] });
+      if (created?.id) setProjectID(created.id);
+      setActivePage('board');
+    } catch (error: any) {
+      setCreateError(error?.response?.data?.error?.message ?? 'Не удалось создать проект. Проверьте права доступа и соединение с сервером.');
+    }
   }
 
   async function createTask(e: FormEvent) {
     e.preventDefault();
-
     if (!currentProject || !newTask.trim()) return;
+    setCreateError('');
+    try {
+      await api.post(`/projects/${currentProject.id}/tasks`, {
+        title: newTask.trim(), status: 'todo', priority: newPriority,
+      });
+      setNewTask('');
+      setNewPriority('medium');
+      setShowCreate(false);
+      await qc.invalidateQueries({ queryKey: ['tasks'] });
+      await qc.invalidateQueries({ queryKey: ['dashboard'] });
+    } catch (error: any) {
+      setCreateError(error?.response?.data?.error?.message ?? 'Не удалось создать задачу.');
+    }
+  }
 
-    await api.post(
-      `/projects/${currentProject.id}/tasks`,
-      {
-        title: newTask.trim(),
-        status: 'todo',
-        priority: newPriority,
-      }
-    );
+  async function saveProject(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingProject) return;
+    const form = new FormData(e.currentTarget);
+    const name = String(form.get('name') ?? '').trim();
+    const description = String(form.get('description') ?? '').trim();
+    if (!name) {
+      setEditError('Название проекта обязательно.');
+      return;
+    }
+    try {
+      await api.patch(`/projects/${editingProject.id}`, { name, description });
+      setEditingProject(null);
+      setEditError('');
+      await qc.invalidateQueries({ queryKey: ['projects'] });
+    } catch {
+      setEditError('Не удалось сохранить проект. Проверьте права доступа.');
+    }
+  }
 
-    setNewTask('');
-    setNewPriority('medium');
-    setShowCreate(false);
+  async function deleteProject(project: Project) {
+    if (!window.confirm(`Удалить проект «${project.name}» и все его задачи? Это действие нельзя отменить.`)) return;
+    try {
+      await api.delete(`/projects/${project.id}`);
+      if (projectID === project.id) setProjectID(null);
+      await qc.invalidateQueries({ queryKey: ['projects'] });
+      await qc.invalidateQueries({ queryKey: ['tasks'] });
+      await qc.invalidateQueries({ queryKey: ['dashboard'] });
+    } catch (error: any) {
+      const message = error?.response?.data?.message ?? error?.response?.data?.error?.message ?? error?.message;
+      window.alert(`Не удалось удалить проект${message ? `: ${message}` : '. Проверьте права доступа.'}`);
+    }
+  }
 
-    await qc.invalidateQueries({
-      queryKey: ['tasks'],
-    });
+  async function saveTask(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingTask) return;
+    const form = new FormData(e.currentTarget);
+    const title = String(form.get('title') ?? '').trim();
+    const description = String(form.get('description') ?? '').trim();
+    const priority = String(form.get('priority') ?? 'medium') as Task['priority'];
+    if (!title) {
+      setEditError('Название задачи обязательно.');
+      return;
+    }
+    try {
+      await api.patch(`/tasks/${editingTask.id}`, { title, description, priority });
+      setEditingTask(null);
+      setEditError('');
+      await qc.invalidateQueries({ queryKey: ['tasks'] });
+      await qc.invalidateQueries({ queryKey: ['dashboard'] });
+    } catch {
+      setEditError('Не удалось сохранить задачу. Проверьте права доступа.');
+    }
+  }
 
-    await qc.invalidateQueries({
-      queryKey: ['dashboard'],
-    });
+  async function deleteTask(task: Task) {
+    if (!window.confirm(`Удалить задачу «${task.title}»? Это действие нельзя отменить.`)) return;
+    try {
+      await api.delete(`/tasks/${task.id}`);
+      await qc.invalidateQueries({ queryKey: ['tasks'] });
+      await qc.invalidateQueries({ queryKey: ['dashboard'] });
+    } catch (error: any) {
+      const message = error?.response?.data?.message ?? error?.response?.data?.error?.message ?? error?.message;
+      window.alert(`Не удалось удалить задачу${message ? `: ${message}` : '. Проверьте права доступа.'}`);
+    }
   }
 
   async function moveTask(
@@ -433,7 +501,7 @@ function App() {
 
           <button
             className="icon-button tiny"
-            onClick={() => setShowCreate(true)}
+            onClick={() => { setCreateKind('project'); setCreateError(''); setShowCreate(true); }}
             aria-label="Создать проект"
           >
             <Plus size={14} />
@@ -442,22 +510,23 @@ function App() {
 
         <div className="project-list">
           {projects.map(p => (
-            <button
-              key={p.id}
-              className={`project-link ${
-                currentProject?.id === p.id ? 'active' : ''
-              }`}
-              onClick={() => setProjectID(p.id)}
-            >
-              <span className="project-color" />
-              {p.name}
-            </button>
+            <div className={`project-row ${currentProject?.id === p.id ? 'active' : ''}`} key={p.id}>
+              <button
+                className={`project-link ${currentProject?.id === p.id ? 'active' : ''}`}
+                onClick={() => setProjectID(p.id)}
+              >
+                <span className="project-color" />
+                <span className="project-name">{p.name}</span>
+              </button>
+              <button className="row-action" aria-label={`Редактировать проект ${p.name}`} title="Редактировать проект" onClick={() => { setEditError(''); setEditingProject(p); }}><Pencil size={13} /></button>
+              <button className="row-action danger" aria-label={`Удалить проект ${p.name}`} title="Удалить проект" onClick={() => void deleteProject(p)}><Trash2 size={13} /></button>
+            </div>
           ))}
         </div>
 
         <button
           className="nav-item"
-          onClick={() => setShowCreate(true)}
+          onClick={() => { setCreateKind('project'); setCreateError(''); setShowCreate(true); }}
         >
           <Plus size={18} />
           Новый проект
@@ -644,7 +713,7 @@ function App() {
 
             <button
               className="primary"
-              onClick={() => setShowCreate(true)}
+              onClick={() => { setCreateKind(activePage === 'board' ? 'task' : 'project'); setCreateError(''); setShowCreate(true); }}
             >
               <Plus size={17} />
               {activePage === 'board' ? 'Новая задача' : 'Создать'}
@@ -733,7 +802,7 @@ function App() {
 
                   <button
                     className="primary"
-                    onClick={() => setShowCreate(true)}
+                    onClick={() => { setCreateKind('project'); setCreateError(''); setShowCreate(true); }}
                   >
                     Создать проект
                   </button>
@@ -759,6 +828,8 @@ function App() {
                         )}
                         onMove={moveTask}
                         onPriorityChange={changePriority}
+                        onEdit={task => { setEditError(''); setEditingTask(task); }}
+                        onDelete={deleteTask}
                       />
                     ))}
                   </div>
@@ -775,6 +846,7 @@ function App() {
           onMouseDown={e => {
             if (e.target === e.currentTarget) {
               setShowCreate(false);
+              setCreateError('');
             }
           }}
         >
@@ -793,32 +865,28 @@ function App() {
             </p>
 
             <h2>
-              {currentProject
-                ? 'Создать задачу'
-                : 'Создать проект'}
+              {createKind === 'task' ? 'Создать задачу' : 'Создать проект'}
             </h2>
 
             <form
               className="form-stack"
               onSubmit={
-                currentProject ? createTask : createProject
+                createKind === 'task' ? createTask : createProject
               }
             >
               <label>
-                {currentProject
-                  ? 'Название задачи'
-                  : 'Название проекта'}
+                {createKind === 'task' ? 'Название задачи' : 'Название проекта'}
 
                 <input
                   autoFocus
-                  value={currentProject ? newTask : newProject}
+                  value={createKind === 'task' ? newTask : newProject}
                   onChange={e =>
-                    currentProject
+                    createKind === 'task'
                       ? setNewTask(e.target.value)
                       : setNewProject(e.target.value)
                   }
                   placeholder={
-                    currentProject
+                    createKind === 'task'
                       ? 'Например, подготовить API'
                       : 'Например, дипломный проект'
                   }
@@ -826,7 +894,7 @@ function App() {
                 />
               </label>
 
-              {currentProject && (
+              {createKind === 'task' && currentProject && (
                 <label>
                   Приоритет задачи
 
@@ -847,9 +915,43 @@ function App() {
                 </label>
               )}
 
+              {createError && <div className="error-box" role="alert">{createError}</div>}
               <button className="primary full">
                 Создать
               </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editingProject && (
+        <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setEditingProject(null); }}>
+          <div className="modal">
+            <button className="modal-close" type="button" onClick={() => setEditingProject(null)} aria-label="Закрыть"><X size={19} /></button>
+            <p className="eyebrow">PROJECT SETTINGS</p>
+            <h2>Редактировать проект</h2>
+            <form className="form-stack" onSubmit={saveProject}>
+              <label>Название проекта<input name="name" defaultValue={editingProject.name} maxLength={120} required /></label>
+              <label>Описание<textarea name="description" defaultValue={editingProject.description} rows={4} maxLength={2000} /></label>
+              {editError && <div className="error-box" role="alert">{editError}</div>}
+              <button className="primary full" type="submit">Сохранить изменения</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editingTask && (
+        <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setEditingTask(null); }}>
+          <div className="modal">
+            <button className="modal-close" type="button" onClick={() => setEditingTask(null)} aria-label="Закрыть"><X size={19} /></button>
+            <p className="eyebrow">TASK SETTINGS · TF-{editingTask.id}</p>
+            <h2>Редактировать задачу</h2>
+            <form className="form-stack" onSubmit={saveTask}>
+              <label>Название задачи<input name="title" defaultValue={editingTask.title} maxLength={200} required /></label>
+              <label>Описание<textarea name="description" defaultValue={editingTask.description} rows={4} maxLength={5000} /></label>
+              <label>Приоритет<select name="priority" defaultValue={editingTask.priority}>{priorities.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}</select></label>
+              {editError && <div className="error-box" role="alert">{editError}</div>}
+              <button className="primary full" type="submit">Сохранить изменения</button>
             </form>
           </div>
         </div>
@@ -1006,15 +1108,16 @@ function KanbanColumn({
   tasks,
   onMove,
   onPriorityChange,
+  onEdit,
+  onDelete,
 }: {
   status: TaskStatus;
   label: string;
   tasks: Task[];
   onMove: (task: Task, status: TaskStatus) => void;
-  onPriorityChange: (
-    task: Task,
-    priority: Task['priority']
-  ) => void;
+  onPriorityChange: (task: Task, priority: Task['priority']) => void;
+  onEdit: (task: Task) => void;
+  onDelete: (task: Task) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: status,
@@ -1042,6 +1145,8 @@ function KanbanColumn({
             task={task}
             onMove={onMove}
             onPriorityChange={onPriorityChange}
+            onEdit={onEdit}
+            onDelete={onDelete}
           />
         ))}
       </div>
@@ -1053,13 +1158,14 @@ function TaskCard({
   task,
   onMove,
   onPriorityChange,
+  onEdit,
+  onDelete,
 }: {
   task: Task;
   onMove: (task: Task, status: TaskStatus) => void;
-  onPriorityChange: (
-    task: Task,
-    priority: Task['priority']
-  ) => void;
+  onPriorityChange: (task: Task, priority: Task['priority']) => void;
+  onEdit: (task: Task) => void;
+  onDelete: (task: Task) => void;
 }) {
   const {
     attributes,
@@ -1090,10 +1196,11 @@ function TaskCard({
         <span className={`priority ${task.priority}`}>
           {priorityLabel(task.priority)}
         </span>
-
-        <span className="task-id">
-          TF-{task.id}
-        </span>
+        <span className="task-id">TF-{task.id}</span>
+        <div className="task-actions">
+          <button type="button" className="row-action" aria-label={`Редактировать задачу ${task.title}`} title="Редактировать задачу" onPointerDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onEdit(task); }}><Pencil size={13} /></button>
+          <button type="button" className="row-action danger" aria-label={`Удалить задачу ${task.title}`} title="Удалить задачу" onPointerDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDelete(task); }}><Trash2 size={13} /></button>
+        </div>
       </div>
 
       <h4>{task.title}</h4>

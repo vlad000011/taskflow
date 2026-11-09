@@ -295,8 +295,10 @@ func (h *Handler) DeleteProject(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Проект не найден")
 		return
 	}
-	if !service.CanDeleteProject(role(c), p.OwnerID, uid(c)) {
-		httpx.Error(c, 403, "FORBIDDEN", "Удалить проект может только владелец")
+	// A project lead may manage and delete their project even when they
+	// were assigned the lead role through project membership rather than
+	// being the original creator. Global admins retain access to all projects.
+	if !h.requireProjectRole(c, id, "lead", "admin") {
 		return
 	}
 	err := h.DB.Transaction(func(tx *gorm.DB) error {
@@ -514,12 +516,22 @@ func (h *Handler) DeleteTask(c *gin.Context) {
 	if !h.requireProjectRole(c, pid, "lead", "admin") {
 		return
 	}
-	h.DB.Transaction(func(tx *gorm.DB) error {
-		tx.Where("task_id = ?", t.ID).Delete(&model.Comment{})
-		tx.Where("task_id = ?", t.ID).Delete(&model.TaskHistory{})
-		tx.Where("task_id = ?", t.ID).Delete(&model.SprintTask{})
+	err := h.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", t.ID).Delete(&model.Comment{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", t.ID).Delete(&model.TaskHistory{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", t.ID).Delete(&model.SprintTask{}).Error; err != nil {
+			return err
+		}
 		return tx.Delete(&t).Error
 	})
+	if err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось удалить задачу")
+		return
+	}
 	c.JSON(200, gin.H{"data": gin.H{"deleted": true}})
 }
 func (h *Handler) AddComment(c *gin.Context) {
