@@ -5,8 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 	"io"
 	"net/http"
 	"os"
@@ -18,6 +16,9 @@ import (
 	"taskflow/backend/internal/model"
 	"taskflow/backend/internal/service"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type Handler struct {
@@ -28,6 +29,29 @@ type Handler struct {
 func New(db *gorm.DB, cfg config.Config) *Handler { return &Handler{DB: db, Cfg: cfg} }
 func uid(c *gin.Context) uint                     { v, _ := c.Get("userID"); return v.(uint) }
 func fail(c *gin.Context, code, msg string)       { httpx.Error(c, 400, code, msg) }
+func role(c *gin.Context) string                  { v, _ := c.Get("role"); r, _ := v.(string); return r }
+func isAdmin(c *gin.Context) bool                 { return role(c) == "admin" }
+func (h *Handler) projectRole(c *gin.Context, projectID string) string {
+	if isAdmin(c) {
+		return "admin"
+	}
+	var m model.ProjectMember
+	if h.DB.Where("project_id = ? AND user_id = ?", projectID, uid(c)).First(&m).Error != nil {
+		return ""
+	}
+	return m.Role
+}
+func (h *Handler) requireProjectRole(c *gin.Context, projectID string, allowed ...string) bool {
+	r := h.projectRole(c, projectID)
+	for _, a := range allowed {
+		if r == a {
+			return true
+		}
+	}
+	httpx.Error(c, http.StatusForbidden, "FORBIDDEN", "Недостаточно прав для операции в проекте")
+	return false
+}
+
 func (h *Handler) Register(c *gin.Context) {
 	var in struct {
 		Email    string `json:"email"`
@@ -186,6 +210,10 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	c.JSON(200, gin.H{"data": gin.H{"changed": true}})
 }
 func (h *Handler) CreateProject(c *gin.Context) {
+	if role(c) != "lead" && !isAdmin(c) {
+		httpx.Error(c, 403, "FORBIDDEN", "Создавать проекты может руководитель или администратор")
+		return
+	}
 	var in struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
@@ -204,7 +232,10 @@ func (h *Handler) CreateProject(c *gin.Context) {
 }
 func (h *Handler) ListProjects(c *gin.Context) {
 	var ps []model.Project
-	q := h.DB.Model(&model.Project{}).Joins("JOIN project_members pm ON pm.project_id = projects.id").Where("pm.user_id = ?", uid(c))
+	q := h.DB.Model(&model.Project{})
+	if !isAdmin(c) {
+		q = q.Joins("JOIN project_members pm ON pm.project_id = projects.id").Where("pm.user_id = ?", uid(c))
+	}
 	if s := c.Query("search"); s != "" {
 		q = q.Where("projects.name ILIKE ?", "%"+s+"%")
 	}
@@ -224,6 +255,9 @@ func (h *Handler) Project(c *gin.Context) {
 	httpx.OK(c, p)
 }
 func (h *Handler) canAccessProject(c *gin.Context, projectID string) bool {
+	if isAdmin(c) {
+		return true
+	}
 	var n int64
 	h.DB.Model(&model.ProjectMember{}).Where("project_id = ? AND user_id = ?", projectID, uid(c)).Count(&n)
 	if n == 0 {
@@ -235,6 +269,9 @@ func (h *Handler) canAccessProject(c *gin.Context, projectID string) bool {
 func (h *Handler) UpdateProject(c *gin.Context) {
 	id := c.Param("id")
 	if !h.canAccessProject(c, id) {
+		return
+	}
+	if !h.requireProjectRole(c, id, "lead", "admin") {
 		return
 	}
 	var in struct {
@@ -258,16 +295,45 @@ func (h *Handler) DeleteProject(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Проект не найден")
 		return
 	}
-	if p.OwnerID != uid(c) {
+	if !isAdmin(c) && p.OwnerID != uid(c) {
 		httpx.Error(c, 403, "FORBIDDEN", "Удалить проект может только владелец")
 		return
 	}
-	h.DB.Transaction(func(tx *gorm.DB) error {
-		tx.Where("project_id = ?", id).Delete(&model.ProjectMember{})
-		tx.Where("project_id = ?", id).Delete(&model.Task{})
-		tx.Where("project_id = ?", id).Delete(&model.Sprint{})
+	err := h.DB.Transaction(func(tx *gorm.DB) error {
+		var tasks []model.Task
+		if err := tx.Where("project_id = ?", id).Find(&tasks).Error; err != nil {
+			return err
+		}
+		ids := make([]uint, 0, len(tasks))
+		for _, task := range tasks {
+			ids = append(ids, task.ID)
+		}
+		if len(ids) > 0 {
+			if err := tx.Where("task_id IN ?", ids).Delete(&model.Comment{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("task_id IN ?", ids).Delete(&model.TaskHistory{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("task_id IN ?", ids).Delete(&model.SprintTask{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("project_id = ?", id).Delete(&model.ProjectMember{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("project_id = ?", id).Delete(&model.Task{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("project_id = ?", id).Delete(&model.Sprint{}).Error; err != nil {
+			return err
+		}
 		return tx.Delete(&p).Error
 	})
+	if err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось удалить проект")
+		return
+	}
 	c.JSON(200, gin.H{"data": gin.H{"deleted": true}})
 }
 func (h *Handler) ListTasks(c *gin.Context) {
@@ -323,6 +389,9 @@ func (h *Handler) CreateTask(c *gin.Context) {
 	if !h.canAccessProject(c, pid) {
 		return
 	}
+	if !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
 	var in struct {
 		Title       string     `json:"title"`
 		Description string     `json:"description"`
@@ -371,9 +440,11 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
 		return
 	}
-	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
+	pid := strconv.FormatUint(uint64(t.ProjectID), 10)
+	if !h.canAccessProject(c, pid) {
 		return
 	}
+	pr := h.projectRole(c, pid)
 	var in struct {
 		Title       *string    `json:"title"`
 		Description *string    `json:"description"`
@@ -384,6 +455,20 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 	}
 	if c.ShouldBindJSON(&in) != nil {
 		fail(c, "VALIDATION_ERROR", "Некорректные данные")
+		return
+	}
+	if pr == "teacher" {
+		httpx.Error(c, 403, "FORBIDDEN", "Преподаватель имеет доступ только для чтения")
+		return
+	}
+	if pr == "participant" {
+		if t.AssigneeID == nil || *t.AssigneeID != uid(c) || in.Status == nil || in.Title != nil || in.Description != nil || in.Priority != nil || in.AssigneeID != nil || in.DueDate != nil {
+			httpx.Error(c, 403, "FORBIDDEN", "Участник может менять только статус назначенной ему задачи")
+			return
+		}
+	}
+	if pr != "participant" && pr != "lead" && pr != "admin" {
+		httpx.Error(c, 403, "FORBIDDEN", "Недостаточно прав")
 		return
 	}
 	updates := map[string]any{}
@@ -402,8 +487,10 @@ func (h *Handler) UpdateTask(c *gin.Context) {
 			fail(c, "VALIDATION_ERROR", "Недопустимый статус")
 			return
 		}
-		updates["status"] = *in.Status
-		h.DB.Create(&model.TaskHistory{TaskID: t.ID, ActorID: uid(c), Field: "status", OldValue: t.Status, NewValue: *in.Status})
+		if t.Status != *in.Status {
+			updates["status"] = *in.Status
+			h.DB.Create(&model.TaskHistory{TaskID: t.ID, ActorID: uid(c), Field: "status", OldValue: t.Status, NewValue: *in.Status})
+		}
 	}
 	if in.Priority != nil {
 		if !service.ValidPriority(*in.Priority) {
@@ -429,7 +516,11 @@ func (h *Handler) DeleteTask(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
 		return
 	}
-	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
+	pid := strconv.FormatUint(uint64(t.ProjectID), 10)
+	if !h.canAccessProject(c, pid) {
+		return
+	}
+	if !h.requireProjectRole(c, pid, "lead", "admin") {
 		return
 	}
 	h.DB.Transaction(func(tx *gorm.DB) error {
@@ -446,7 +537,12 @@ func (h *Handler) AddComment(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
 		return
 	}
-	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
+	pid := strconv.FormatUint(uint64(t.ProjectID), 10)
+	if !h.canAccessProject(c, pid) {
+		return
+	}
+	if h.projectRole(c, pid) == "teacher" {
+		httpx.Error(c, 403, "FORBIDDEN", "Преподаватель имеет доступ только для чтения")
 		return
 	}
 	var in struct {
@@ -476,6 +572,9 @@ func (h *Handler) ListComments(c *gin.Context) {
 func (h *Handler) CreateSprint(c *gin.Context) {
 	pid := c.Param("id")
 	if !h.canAccessProject(c, pid) {
+		return
+	}
+	if !h.requireProjectRole(c, pid, "lead", "admin") {
 		return
 	}
 	var in struct {
@@ -556,7 +655,13 @@ func (h *Handler) Upload(c *gin.Context) {
 		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
 		return
 	}
-	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
+	pid := strconv.FormatUint(uint64(t.ProjectID), 10)
+	if !h.canAccessProject(c, pid) {
+		return
+	}
+	pr := h.projectRole(c, pid)
+	if pr == "teacher" || (pr == "participant" && (t.AssigneeID == nil || *t.AssigneeID != uid(c))) {
+		httpx.Error(c, 403, "FORBIDDEN", "Нет права прикреплять файл к этой задаче")
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(h.Cfg.MaxUploadMB)*1024*1024)

@@ -2,10 +2,6 @@ package main
 
 import (
 	"fmt"
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 	"log"
 	"os"
 	"taskflow/backend/internal/config"
@@ -14,6 +10,11 @@ import (
 	"taskflow/backend/internal/model"
 	"taskflow/backend/internal/service"
 	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -45,7 +46,7 @@ func main() {
 	api.POST("/auth/reset-password", h.ResetPassword)
 	api.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
 	auth := api.Group("")
-	auth.Use(middleware.Auth(cfg))
+	auth.Use(middleware.Auth(cfg, db))
 	auth.POST("/auth/logout", h.Logout)
 	auth.GET("/users/me", h.Me)
 	auth.PATCH("/users/me", h.UpdateMe)
