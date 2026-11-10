@@ -864,6 +864,19 @@ function App() {
                 />
               </div>
 
+              {currentProject && (
+                <ProjectTools
+                  project={currentProject}
+                  members={membersQuery.data ?? []}
+                  tasks={tasks}
+                  canManage={user.role === 'admin' || user.role === 'lead'}
+                  onChanged={async () => {
+                    await qc.invalidateQueries({ queryKey: ['project-members', currentProject.id] });
+                    await qc.invalidateQueries({ queryKey: ['tasks'] });
+                  }}
+                />
+              )}
+
               <div className="toolbar task-toolbar">
                 <div className="search-box">
                   <Search size={17} />
@@ -1074,6 +1087,7 @@ function App() {
               {editError && <div className="error-box" role="alert">{editError}</div>}
               <button className="primary full" type="submit">Сохранить изменения</button>
             </form>
+            <TaskComments taskId={editingTask.id} />
           </div>
         </div>
       )}
@@ -1201,6 +1215,71 @@ function App() {
       )}
     </div>
   );
+}
+
+
+type ProjectMember = { id: number; name: string; email: string; role?: string };
+type Sprint = { id: number; name: string; start_date: string; end_date: string; is_closed: boolean };
+
+function ProjectTools({ project, members, tasks, canManage, onChanged }: {
+  project: Project; members: ProjectMember[]; tasks: Task[]; canManage: boolean; onChanged: () => void | Promise<void>;
+}) {
+  const qc = useQueryClient();
+  const [email, setEmail] = useState('');
+  const [memberRole, setMemberRole] = useState('participant');
+  const [sprintName, setSprintName] = useState('');
+  const [startDate, setStartDate] = useState(new Date().toISOString().slice(0, 10));
+  const [endDate, setEndDate] = useState(new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10));
+  const [message, setMessage] = useState('');
+  const sprintsQuery = useQuery({ queryKey: ['sprints', project.id], queryFn: async () => (await api.get(`/projects/${project.id}/sprints`)).data.data as Sprint[] });
+  const sprints = sprintsQuery.data ?? [];
+  async function addMember(e: FormEvent) {
+    e.preventDefault(); setMessage('');
+    try { await api.post(`/projects/${project.id}/members`, { email, role: memberRole }); setEmail(''); setMessage('Участник добавлен.'); await onChanged(); }
+    catch (err: any) { setMessage(err?.response?.data?.error?.message ?? 'Не удалось добавить участника.'); }
+  }
+  async function removeMember(member: ProjectMember) {
+    if (!window.confirm(`Удалить ${member.name || member.email} из проекта?`)) return;
+    try { await api.delete(`/projects/${project.id}/members/${member.id}`); setMessage('Участник удалён.'); await onChanged(); }
+    catch (err: any) { setMessage(err?.response?.data?.error?.message ?? 'Не удалось удалить участника.'); }
+  }
+  async function addSprint(e: FormEvent) {
+    e.preventDefault(); setMessage('');
+    try { await api.post(`/projects/${project.id}/sprints`, { name: sprintName.trim(), start_date: new Date(`${startDate}T00:00:00`).toISOString(), end_date: new Date(`${endDate}T23:59:59`).toISOString() }); setSprintName(''); await qc.invalidateQueries({ queryKey: ['sprints', project.id] }); setMessage('Спринт создан.'); }
+    catch (err: any) { setMessage(err?.response?.data?.error?.message ?? 'Не удалось создать спринт.'); }
+  }
+  async function toggleSprint(sprint: Sprint) {
+    await api.patch(`/projects/${project.id}/sprints/${sprint.id}`, { is_closed: !sprint.is_closed });
+    await qc.invalidateQueries({ queryKey: ['sprints', project.id] });
+  }
+  async function deleteSprint(sprint: Sprint) {
+    if (!window.confirm(`Удалить спринт «${sprint.name}»? Задачи останутся в проекте без спринта.`)) return;
+    await api.delete(`/projects/${project.id}/sprints/${sprint.id}`);
+    await qc.invalidateQueries({ queryKey: ['sprints', project.id] }); await onChanged();
+  }
+  async function assignSprint(taskId: number, value: string) {
+    await api.patch(`/tasks/${taskId}/sprint`, { sprint_id: value ? Number(value) : null });
+    await qc.invalidateQueries({ queryKey: ['tasks'] });
+  }
+  return <section className="project-tools" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))', gap: 16, padding: 16, marginBottom: 18, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--surface)' }}>
+    <div><h3 style={{ marginTop: 0 }}>Спринты</h3>
+      {canManage && <form onSubmit={addSprint} className="form-stack" style={{ marginBottom: 12 }}><input aria-label="Название спринта" placeholder="Название спринта" value={sprintName} onChange={e => setSprintName(e.target.value)} required maxLength={160}/><div style={{ display: 'flex', gap: 8 }}><input aria-label="Начало спринта" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} required/><input aria-label="Окончание спринта" type="date" value={endDate} onChange={e => setEndDate(e.target.value)} required/></div><button className="primary" type="submit">Создать спринт</button></form>}
+      {sprintsQuery.isLoading ? <p className="muted">Загрузка спринтов…</p> : sprints.length === 0 ? <p className="muted">Спринтов пока нет.</p> : sprints.map(sp => <div key={sp.id} style={{ borderTop: '1px solid var(--border)', padding: '9px 0' }}><strong>{sp.name}</strong> <span className="muted">{sp.is_closed ? '· Закрыт' : '· Активен'}</span><p className="muted" style={{ margin: '4px 0' }}>{new Date(sp.start_date).toLocaleDateString('ru-RU')} — {new Date(sp.end_date).toLocaleDateString('ru-RU')}</p>{canManage && <div style={{ display: 'flex', gap: 7 }}><button className="secondary" type="button" onClick={() => toggleSprint(sp)}>{sp.is_closed ? 'Открыть' : 'Закрыть'}</button><button className="secondary" type="button" onClick={() => deleteSprint(sp)}>Удалить</button></div>}</div>)}
+      {canManage && tasks.length > 0 && <div style={{ marginTop: 12 }}><strong>Распределение задач</strong>{tasks.map(task => <label key={task.id} style={{ display: 'grid', gridTemplateColumns: '1fr 130px', gap: 8, alignItems: 'center', marginTop: 7, fontSize: 12 }}><span title={task.title}>{task.title}</span><select aria-label={`Спринт задачи ${task.title}`} value={(task as Task & { sprint_id?: number }).sprint_id ?? ''} onChange={e => assignSprint(task.id, e.target.value)}><option value="">Без спринта</option>{sprints.filter(sp => !sp.is_closed).map(sp => <option key={sp.id} value={sp.id}>{sp.name}</option>)}</select></label>)}</div>}
+    </div>
+    <div><h3 style={{ marginTop: 0 }}>Участники проекта</h3>{members.map(m => <div key={m.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '7px 0', borderBottom: '1px solid var(--border)' }}><span><strong>{m.name || m.email}</strong><br/><small className="muted">{m.email}</small></span>{canManage && <button type="button" className="secondary" onClick={() => removeMember(m)} aria-label={`Удалить ${m.email}`}>Удалить</button>}</div>)}
+      {canManage && <form onSubmit={addMember} className="form-stack" style={{ marginTop: 12 }}><strong>Добавить существующего пользователя</strong><input type="email" placeholder="user@example.com" aria-label="Email нового участника" value={email} onChange={e => setEmail(e.target.value)} required/><select aria-label="Роль участника" value={memberRole} onChange={e => setMemberRole(e.target.value)}><option value="participant">Участник</option><option value="teacher">Наблюдатель</option></select><button className="primary" type="submit">Добавить участника</button></form>}
+    </div>{message && <p className="muted" role="status" style={{ gridColumn: '1 / -1' }}>{message}</p>}
+  </section>;
+}
+
+function TaskComments({ taskId }: { taskId: number }) {
+  const qc = useQueryClient();
+  const [body, setBody] = useState('');
+  const [error, setError] = useState('');
+  const query = useQuery({ queryKey: ['comments', taskId], queryFn: async () => (await api.get(`/tasks/${taskId}/comments`)).data.data as { id: number; body: string; user_id: number; user_name?: string; created_at: string }[] });
+  async function submit(e: FormEvent) { e.preventDefault(); if (!body.trim()) return; setError(''); try { await api.post(`/tasks/${taskId}/comments`, { body: body.trim() }); setBody(''); await qc.invalidateQueries({ queryKey: ['comments', taskId] }); } catch (err: any) { setError(err?.response?.data?.error?.message ?? 'Не удалось добавить комментарий.'); } }
+  return <section style={{ marginTop: 22, borderTop: '1px solid var(--border)', paddingTop: 16 }}><h3>Комментарии</h3>{query.isLoading ? <p className="muted">Загрузка…</p> : (query.data ?? []).length === 0 ? <p className="muted">Комментариев пока нет.</p> : (query.data ?? []).map(c => <article key={c.id} style={{ padding: 10, marginBottom: 8, borderRadius: 8, background: 'var(--surface2)' }}><strong>{c.user_name || `Пользователь #${c.user_id}`}</strong><small className="muted" style={{ marginLeft: 8 }}>{new Date(c.created_at).toLocaleString('ru-RU')}</small><p style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>{c.body}</p></article>)}<form onSubmit={submit} className="form-stack"><label>Новый комментарий<textarea value={body} onChange={e => setBody(e.target.value)} rows={3} maxLength={4000} required placeholder="Напишите комментарий…"/></label>{error && <div className="error-box" role="alert">{error}</div>}<button className="primary" type="submit" disabled={!body.trim()}>Отправить</button></form></section>;
 }
 
 function Stat({

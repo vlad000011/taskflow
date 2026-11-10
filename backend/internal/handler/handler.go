@@ -254,9 +254,10 @@ func (h *Handler) ProjectMembers(c *gin.Context) {
 		ID    uint   `json:"id"`
 		Name  string `json:"name"`
 		Email string `json:"email"`
+		Role  string `json:"role"`
 	}
 	err := h.DB.Table("users").
-		Select("users.id, users.name, users.email").
+		Select("users.id, users.name, users.email, pm.role").
 		Joins("JOIN project_members pm ON pm.user_id = users.id").
 		Where("pm.project_id = ?", projectID).
 		Order("users.name ASC").Scan(&members).Error
@@ -658,8 +659,19 @@ func (h *Handler) ListComments(c *gin.Context) {
 	if !h.canAccessProject(c, strconv.FormatUint(uint64(t.ProjectID), 10)) {
 		return
 	}
-	var rows []model.Comment
-	h.DB.Where("task_id = ?", t.ID).Order("created_at ASC").Find(&rows)
+	type commentView struct {
+		ID        uint      `json:"id"`
+		TaskID    uint      `json:"task_id"`
+		UserID    uint      `json:"user_id"`
+		UserName  string    `json:"user_name"`
+		Body      string    `json:"body"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	var rows []commentView
+	if err := h.DB.Table("comments").Select("comments.id, comments.task_id, comments.user_id, users.name AS user_name, comments.body, comments.created_at").Joins("JOIN users ON users.id = comments.user_id").Where("comments.task_id = ?", t.ID).Order("comments.created_at ASC").Scan(&rows).Error; err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось получить комментарии")
+		return
+	}
 	httpx.OK(c, rows)
 }
 func (h *Handler) CreateSprint(c *gin.Context) {
@@ -920,3 +932,171 @@ func percent(a, b int64) float64 {
 }
 
 var _ = errors.Is
+
+// AddProjectMember adds an existing account to a project. Only project leads/admins may manage membership.
+func (h *Handler) AddProjectMember(c *gin.Context) {
+	pid := c.Param("id")
+	if !h.canAccessProject(c, pid) || !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
+	var in struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+	if c.ShouldBindJSON(&in) != nil || strings.TrimSpace(in.Email) == "" {
+		fail(c, "VALIDATION_ERROR", "Укажите email пользователя")
+		return
+	}
+	var u model.User
+	if h.DB.Where("LOWER(email) = ?", strings.ToLower(strings.TrimSpace(in.Email))).First(&u).Error != nil {
+		httpx.Error(c, 404, "USER_NOT_FOUND", "Пользователь с таким email не найден")
+		return
+	}
+	if u.IsBlocked {
+		fail(c, "USER_BLOCKED", "Нельзя добавить заблокированного пользователя")
+		return
+	}
+	memberRole := in.Role
+	if memberRole == "" {
+		memberRole = "participant"
+	}
+	if memberRole != "participant" && memberRole != "teacher" {
+		fail(c, "VALIDATION_ERROR", "Допустимые роли участника: participant или teacher")
+		return
+	}
+	n, _ := strconv.ParseUint(pid, 10, 64)
+	m := model.ProjectMember{ProjectID: uint(n), UserID: u.ID, Role: memberRole}
+	if err := h.DB.Create(&m).Error; err != nil {
+		httpx.Error(c, 409, "MEMBER_EXISTS", "Пользователь уже состоит в проекте или не может быть добавлен")
+		return
+	}
+	httpx.OK(c, gin.H{"id": u.ID, "name": u.Name, "email": u.Email, "role": memberRole})
+}
+
+func (h *Handler) RemoveProjectMember(c *gin.Context) {
+	pid := c.Param("id")
+	if !h.canAccessProject(c, pid) || !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
+	var project model.Project
+	if h.DB.First(&project, pid).Error != nil {
+		httpx.Error(c, 404, "NOT_FOUND", "Проект не найден")
+		return
+	}
+	if strconv.FormatUint(uint64(project.OwnerID), 10) == c.Param("userId") {
+		fail(c, "OWNER_PROTECTED", "Нельзя удалить владельца проекта")
+		return
+	}
+	if err := h.DB.Where("project_id = ? AND user_id = ?", pid, c.Param("userId")).Delete(&model.ProjectMember{}).Error; err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось удалить участника")
+		return
+	}
+	c.JSON(200, gin.H{"data": gin.H{"deleted": true}})
+}
+
+func (h *Handler) UpdateSprint(c *gin.Context) {
+	pid := c.Param("id")
+	if !h.canAccessProject(c, pid) || !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
+	var sp model.Sprint
+	if h.DB.Where("id = ? AND project_id = ?", c.Param("sprintId"), pid).First(&sp).Error != nil {
+		httpx.Error(c, 404, "NOT_FOUND", "Спринт не найден")
+		return
+	}
+	var in struct {
+		Name      *string    `json:"name"`
+		StartDate *time.Time `json:"start_date"`
+		EndDate   *time.Time `json:"end_date"`
+		IsClosed  *bool      `json:"is_closed"`
+	}
+	if c.ShouldBindJSON(&in) != nil {
+		fail(c, "VALIDATION_ERROR", "Некорректные данные спринта")
+		return
+	}
+	updates := map[string]any{}
+	if in.Name != nil {
+		if strings.TrimSpace(*in.Name) == "" {
+			fail(c, "VALIDATION_ERROR", "Название обязательно")
+			return
+		}
+		updates["name"] = strings.TrimSpace(*in.Name)
+	}
+	start, end := sp.StartDate, sp.EndDate
+	if in.StartDate != nil {
+		start = *in.StartDate
+		updates["start_date"] = start
+	}
+	if in.EndDate != nil {
+		end = *in.EndDate
+		updates["end_date"] = end
+	}
+	if end.Before(start) {
+		fail(c, "VALIDATION_ERROR", "Дата окончания не может быть раньше даты начала")
+		return
+	}
+	if in.IsClosed != nil {
+		updates["is_closed"] = *in.IsClosed
+	}
+	if len(updates) > 0 {
+		h.DB.Model(&sp).Updates(updates)
+	}
+	h.DB.First(&sp, sp.ID)
+	httpx.OK(c, sp)
+}
+
+func (h *Handler) DeleteSprint(c *gin.Context) {
+	pid := c.Param("id")
+	if !h.canAccessProject(c, pid) || !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
+	var sp model.Sprint
+	if h.DB.Where("id = ? AND project_id = ?", c.Param("sprintId"), pid).First(&sp).Error != nil {
+		httpx.Error(c, 404, "NOT_FOUND", "Спринт не найден")
+		return
+	}
+	if err := h.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Task{}).Where("project_id = ? AND sprint_id = ?", pid, sp.ID).Update("sprint_id", nil).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("sprint_id = ?", sp.ID).Delete(&model.SprintTask{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&sp).Error
+	}); err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось удалить спринт")
+		return
+	}
+	c.JSON(200, gin.H{"data": gin.H{"deleted": true}})
+}
+
+func (h *Handler) SetTaskSprint(c *gin.Context) {
+	var t model.Task
+	if h.DB.First(&t, c.Param("id")).Error != nil {
+		httpx.Error(c, 404, "NOT_FOUND", "Задача не найдена")
+		return
+	}
+	pid := strconv.FormatUint(uint64(t.ProjectID), 10)
+	if !h.canAccessProject(c, pid) || !h.requireProjectRole(c, pid, "lead", "admin") {
+		return
+	}
+	var in struct {
+		SprintID *uint `json:"sprint_id"`
+	}
+	if c.ShouldBindJSON(&in) != nil {
+		fail(c, "VALIDATION_ERROR", "Некорректный sprint_id")
+		return
+	}
+	if in.SprintID != nil {
+		var sp model.Sprint
+		if h.DB.Where("id = ? AND project_id = ?", *in.SprintID, t.ProjectID).First(&sp).Error != nil {
+			fail(c, "VALIDATION_ERROR", "Спринт не принадлежит этому проекту")
+			return
+		}
+	}
+	if err := h.DB.Model(&t).Update("sprint_id", in.SprintID).Error; err != nil {
+		httpx.Error(c, 500, "DB_ERROR", "Не удалось назначить спринт")
+		return
+	}
+	h.Task(c)
+}
